@@ -30,7 +30,14 @@ FLUX_RESTART_WINDOW="${FLUX_RESTART_WINDOW:-3600}"
 FLUX_RESTART_BACKOFF="${FLUX_RESTART_BACKOFF:-10}"
 FLUX_STOP_GRACE="${FLUX_STOP_GRACE:-90}"
 FLUX_BACKUP_HOURS="${FLUX_BACKUP_HOURS:-6}"
-FLUX_BACKUP_KEEP="${FLUX_BACKUP_KEEP:-5}"
+FLUX_BACKUP_KEEP="${FLUX_BACKUP_KEEP:-10}"
+# A start backup is skipped when the newest backup is younger than this: restarts in a row (panel
+# saves, a crash loop, update restarts) must not rotate every good backup away.
+FLUX_BACKUP_MIN_AGE_MINUTES="${FLUX_BACKUP_MIN_AGE_MINUTES:-60}"
+# A game update that did not install is not tried again for this long.
+FLUX_UPDATE_RETRY_HOURS="${FLUX_UPDATE_RETRY_HOURS:-6}"
+FLUX_RESTORE_MARKER="${FLUX_RESTORE_MARKER:-/tmp/flux-restore-requested}"
+FLUX_UPDATE_FAILED="${FLUX_STATE_DIR}/update-failed"
 FLUX_UPDATE_CHECK_MINUTES="${FLUX_UPDATE_CHECK_MINUTES:-30}"
 FLUX_WARN_MINUTES="${FLUX_WARN_MINUTES:-5}"
 # Epic Online Services' dedicated-server client for The Isle: the pair every host and template
@@ -89,7 +96,7 @@ term_handler() {
 trap term_handler TERM INT
 
 update_server() {
-  local attempt validate
+  local attempt validate steam_pid rc
   if flux_truthy "${SKIP_UPDATE:-}" && [ -x "${s}/${FLUX_GAME_BINARY}" ]; then
     flux_log "SKIP_UPDATE is set: not updating the server files"
     return 0
@@ -98,14 +105,24 @@ update_server() {
   flux_log "updating the server from Steam (app ${FLUX_STEAM_APP}, branch ${FLUX_STEAM_BRANCH})"
   validate=""
   for attempt in 1 2 3 4 5; do
+    # In the background and waited for: a foreground command would hold off the TERM trap until
+    # it ended, and Docker's 10 seconds would end the container mid-download instead.
     # shellcheck disable=SC2086  # validate is "" or "validate"
-    if steamcmd +force_install_dir "${s}" +login anonymous +app_update "${FLUX_STEAM_APP}" -beta "${FLUX_STEAM_BRANCH}" ${validate} +quit; then
+    steamcmd +force_install_dir "${s}" +login anonymous +app_update "${FLUX_STEAM_APP}" -beta "${FLUX_STEAM_BRANCH}" ${validate} +quit >/tmp/steamcmd.log 2>&1 &
+    steam_pid=$!
+    wait "${steam_pid}"
+    rc=$?
+    if [ "${terminating}" = "1" ]; then
+      kill "${steam_pid}" 2>/dev/null
+      return 1
+    fi
+    if [ "${rc}" = "0" ]; then
       flux_log "server build $(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")"
       return 0
     fi
     [ "${terminating}" = "1" ] && return 1
     validate="validate"
-    flux_log "WARN steamcmd failed (attempt ${attempt}/5); retrying in 5s with validate"
+    flux_log "WARN steamcmd failed (attempt ${attempt}/5): $(grep -aE 'ERROR|Error|error' /tmp/steamcmd.log | tail -1 | tr -d '\r'); retrying in 5s with validate"
     sleep 5
   done
   if [ -x "${s}/${FLUX_GAME_BINARY}" ]; then
@@ -140,21 +157,63 @@ prepare_user() {
   chown "${FLUX_UID}:${FLUX_UID}" "${s}/TheIsle" 2>/dev/null
 }
 
+# Minutes since the newest backup was written; empty when there is none.
+newest_backup_age() {
+  local newest
+  newest="$(find "${FLUX_BACKUP_DIR}" -maxdepth 1 -name '*-theisle*.tar.gz' -printf '%T@\n' 2>/dev/null | sort -n | tail -1)"
+  [ -n "${newest}" ] && echo $((($(date +%s) - ${newest%.*}) / 60))
+}
+
+# A .tar.gz of Saved/ (the player database, config, bans), taken from a COPY: the database is
+# SQLite with a write-ahead log, and archiving it in place while the server writes gives an
+# archive tar itself calls inconsistent ("file changed as we read it"). The copy is made right
+# after an RCON save, and the database, its WAL and SHM are copied together. $1 = why, $2 = force.
 backup_saved() {
-  local why="$1" out name
+  local why="$1" force="${2:-}" out name stage age
   [ "${FLUX_BACKUP_KEEP}" -gt 0 ] 2>/dev/null || return 0
   [ -d "${d}/Saved/PlayerData" ] || return 0
+  if [ "${why}" = "start" ] && [ -z "${force}" ] && age="$(newest_backup_age)" && [ -n "${age}" ] \
+    && [ "${age}" -lt "${FLUX_BACKUP_MIN_AGE_MINUTES}" ]; then
+    flux_log "backup (start): skipped, the newest is ${age} min old"
+    return 0
+  fi
   mkdir -p "${FLUX_BACKUP_DIR}"
-  name="$(date -u +%Y%m%d-%H%M%S)-theisle.tar.gz"
+  name="$(date -u +%Y%m%d-%H%M%S)-theisle$([ "${why}" = "pre-restore" ] && echo "-pre-restore").tar.gz"
   out="${FLUX_BACKUP_DIR}/${name}"
-  if tar -C "${d}" --exclude='Saved/Logs' --exclude='Saved/Demos' --exclude='Saved/Crashes' -czf "${out}.part" Saved 2>/dev/null \
-    && mv "${out}.part" "${out}"; then
+  stage="$(mktemp -d)"
+  if (cd "${d}" && tar --exclude='Saved/Logs' --exclude='Saved/Demos' --exclude='Saved/Crashes' -cf - Saved) | tar -C "${stage}" -xf - 2>/dev/null \
+    && tar -C "${stage}" -czf "${out}.part" Saved && mv "${out}.part" "${out}"; then
     flux_log "backup (${why}): flux/backups/${name}, $(du -h "${out}" | cut -f1)"
   else
     rm -f "${out}.part"
     flux_log "WARN backup (${why}) failed"
   fi
-  flux_prune "${FLUX_BACKUP_DIR}" "*-theisle.tar.gz" "${FLUX_BACKUP_KEEP}"
+  rm -rf "${stage}"
+  python3 /opt/flux/fluxisle.py prune-backups "${FLUX_BACKUP_KEEP}" | while IFS= read -r line; do flux_log "${line#\# }"; done
+}
+
+# A backup asked for by the panel (flux-isle restore): with the server stopped, a safety backup
+# of what is there now, then the chosen archive unpacked aside and swapped into place.
+restore_saved() {
+  local name="$1" stage
+  case "${name}" in
+    */* | "" | .*) flux_log "WARN restore: '${name}' is not a backup name"; return 1 ;;
+  esac
+  if [ ! -f "${FLUX_BACKUP_DIR}/${name}" ]; then
+    flux_log "WARN restore: flux/backups/${name} does not exist"
+    return 1
+  fi
+  backup_saved "pre-restore" force
+  stage="$(mktemp -d -p "${d}" .restore-XXXXXX)"
+  if ! tar -C "${stage}" -xzf "${FLUX_BACKUP_DIR}/${name}" || [ ! -d "${stage}/Saved" ]; then
+    flux_log "WARN restore: flux/backups/${name} could not be unpacked; nothing changed"
+    rm -rf "${stage}"
+    return 1
+  fi
+  rm -rf "${d}/Saved.before-restore"
+  [ -d "${d}/Saved" ] && mv "${d}/Saved" "${d}/Saved.before-restore"
+  mv "${stage}/Saved" "${d}/Saved" && rm -rf "${stage}" "${d}/Saved.before-restore"
+  flux_log "restore: flux/backups/${name} is in place (the state before it is in the pre-restore backup)"
 }
 
 # shellcheck disable=SC2329  # run in the background below
@@ -184,6 +243,15 @@ restart_with_warning() {
   stop_server
 }
 
+# $1 = a build. True when an update to it was tried less than FLUX_UPDATE_RETRY_HOURS ago and did
+# not install (Steam down, disk full): the server is not restarted for it again and again.
+update_recently_failed() {
+  local target at
+  [ -f "${FLUX_UPDATE_FAILED}" ] || return 1
+  read -r target at <"${FLUX_UPDATE_FAILED}"
+  [ "${target}" = "$1" ] && [ $(($(date +%s) - ${at:-0})) -lt $((FLUX_UPDATE_RETRY_HOURS * 3600)) ]
+}
+
 # shellcheck disable=SC2329  # run in the background below
 # Marks the server running once its RCON answers, then follows Steam and the daily restart.
 watcher() {
@@ -206,7 +274,7 @@ watcher() {
       last_check="${now}"
       build="$(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")"
       public="$(steamcmd +login anonymous +app_info_update 1 +app_info_print "${FLUX_STEAM_APP}" +quit 2>/dev/null | flux_public_build "${FLUX_STEAM_BRANCH}")"
-      if [ -n "${public}" ] && [ -n "${build}" ] && [ "${public}" != "${build}" ]; then
+      if [ -n "${public}" ] && [ -n "${build}" ] && [ "${public}" != "${build}" ] && ! update_recently_failed "${public}"; then
         flux_log "a new Evrima build is on Steam (${build} -> ${public})"
         restart_with_warning "planned: game update ${build} -> ${public}" "a game update"
         exit 0
@@ -226,8 +294,26 @@ start_generation() {
 
   update_server || return 1
   [ "${terminating}" = "1" ] && return 2
+  # An update restart that did not reach its build: remembered, so it is not tried every half hour.
+  if [[ "${last_reason:-}" == "planned: game update "*" -> "* ]]; then
+    local target="${last_reason##* -> }"
+    if [ "$(flux_installed_build "${s}/steamapps/appmanifest_${FLUX_STEAM_APP}.acf")" != "${target}" ]; then
+      printf '%s %s\n' "${target}" "$(date +%s)" >"${FLUX_UPDATE_FAILED}"
+      flux_log "WARN the update to build ${target} did not install; not trying it again for ${FLUX_UPDATE_RETRY_HOURS} h"
+    else
+      rm -f "${FLUX_UPDATE_FAILED}"
+    fi
+  fi
+  while IFS= read -r line; do
+    flux_log "${line#\# }"
+  done < <(isle migrate-legacy 2>&1)
   link_saved
-  backup_saved "start"
+  if [ -f "${FLUX_RESTORE_MARKER}" ]; then
+    restore_saved "$(head -1 "${FLUX_RESTORE_MARKER}")"
+    rm -f "${FLUX_RESTORE_MARKER}"
+  else
+    backup_saved "start"
+  fi
   while IFS= read -r line; do
     flux_log "config: ${line#\# }"
   done < <(isle apply 2>&1)
@@ -313,6 +399,7 @@ while true; do
     exit 0
   fi
   [ -z "${reason}" ] && reason="the server ended on its own (exit ${rc})"
+  last_reason="${reason}"
 
   if flux_restart_counts "${reason}"; then
     now="$(date -u +%s)"

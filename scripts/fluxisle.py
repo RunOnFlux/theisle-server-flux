@@ -12,20 +12,25 @@
     flux-isle bans                     PlayerBans.json
     flux-isle unban <steamid>          lifted on the next start (the server owns the file while it runs)
     flux-isle restart                  save, stop and start again
+    flux-isle backups                  the backups in flux/backups (name, size, date, why)
+    flux-isle restore <backup>         stop, keep a safety backup, put that backup in place, start
+    fluxisle.py migrate-legacy         move a server from the previous image's layout (the entrypoint)
 
 THE RCON IS NEVER PUBLISHED. The Isle's RCON authorises an IP address once a password was right,
 not a connection: anyone behind the same address gets in afterwards with no password (measured).
 It listens on RconPort inside the container and only the panel's exec reaches it, on 127.0.0.1.
 ServerDetails prints the join password in plain text, so its reply is never passed on whole.
 
-Precedence, the same everywhere: an environment variable that is SET (even to "") is applied on
-every start; one that is not set leaves the panel's value, then the default.
+Precedence, the same everywhere: an environment variable that is SET to a value is applied on
+every start; one that is not set, or set EMPTY, leaves the panel's value, then the default. (The
+marketplace writes every declared parameter, blank or not: an empty one is the panel's to decide.)
 """
 
 import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -38,6 +43,13 @@ STATE_DIR = os.environ.get("FLUX_STATE_DIR", os.path.join(DATA_DIR, "flux"))
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 SETTINGS_FILE = os.path.join(STATE_DIR, "settings.json")
 UNBAN_FILE = os.path.join(STATE_DIR, "unban-pending.json")
+BACKUP_DIR = os.environ.get("FLUX_BACKUP_DIR", os.path.join(STATE_DIR, "backups"))
+RESTORE_MARKER = os.environ.get("FLUX_RESTORE_MARKER", "/tmp/flux-restore-requested")
+# The previous image (ghcr.io/auhrus/theisleevrima) synced the WHOLE install: on its volume the
+# saves are at TheIsle/Saved, which our data volume shows at <data>/TheIsle/Saved after the spec
+# moves the mount to /mnt/isle/data.
+LEGACY_SAVED = os.path.join(DATA_DIR, "TheIsle", "Saved")
+MIGRATION_FILE = os.path.join(STATE_DIR, "migrated.json")
 RCON_SECRET = os.path.join(STATE_DIR, "rcon.secret")
 SAVED_DIR = os.path.join(DATA_DIR, "Saved")
 GAME_INI = os.path.join(SAVED_DIR, "Config", "LinuxServer", "Game.ini")
@@ -47,6 +59,9 @@ RCON_PORT = int(os.environ.get("FLUX_RCON_PORT", "8888"))
 
 SESSION = "/Script/TheIsle.TIGameSession"
 STATE_BASE = "/Script/TheIsle.TIGameStateBase"
+# Unreal's own player cap, which AMP's template also writes: MaxPlayerCount is The Isle's, and the
+# engine's GameSession default (16) is not guaranteed to follow it.
+ENGINE_SESSION = "/Script/Engine.GameSession"
 
 # Every class Evrima has as of build 24664709 (the AMP template's list, which the server's own
 # AllowedClasses default matches). Unknown names are kept as typed: new classes ship with patches.
@@ -77,7 +92,8 @@ SETTINGS = {
     "spawnAI": (SESSION, "bSpawnAI", "bool", True),
     "aiSpawnInterval": (SESSION, "AISpawnInterval", "int", 40),
     "aiDensity": (SESSION, "AIDensity", "float", 1.0),
-    "disallowedAI": (SESSION, "DisallowedAIClasses", "csv", []),
+    # One line per class (the AMP template's documented format: "DisallowedAIClasses=Compsognathus").
+    "disallowedAI": (SESSION, "DisallowedAIClasses", "list", []),
     "migration": (SESSION, "bEnableMigration", "bool", True),
     "speciesMigrationTime": (SESSION, "SpeciesMigrationTime", "int", 10800),
     "massMigration": (SESSION, "bEnableMassMigration", "bool", True),
@@ -225,7 +241,7 @@ def effective_settings(settings=None):
     env_for = {v: k for k, v in ENV.items()}
     for name, (_, _, _, default) in SETTINGS.items():
         env = env_for.get(name)
-        if env and env in os.environ:
+        if env and str(os.environ.get(env, "")).strip():
             try:
                 values[name] = coerce(name, os.environ[env] if name != "admins" else steam_ids(os.environ[env]))
                 sources[name] = "env"
@@ -278,13 +294,13 @@ def render_game_ini(existing, values, rcon_password, rcon_port, queue_port):
     owned = {}
     for name, (section, key, kind, _) in SETTINGS.items():
         owned.setdefault(section, {})[key] = (kind, values[name])
-    extra = {SESSION: {
+    extra = {ENGINE_SESSION: {"MaxPlayers": ("int", values["maxPlayers"])}, SESSION: {
         "MapName": ("text", "Gateway"), "bServerPassword": ("bool", bool(values["password"])),
         "bRconEnabled": ("bool", True), "RconPassword": ("text", rcon_password), "RconPort": ("int", rcon_port),
         "QueuePort": ("int", queue_port),
     }}
     for section, keys in extra.items():
-        owned[section].update(keys)
+        owned.setdefault(section, {}).update(keys)
     sections = parse_ini(existing or "")
     seen = set()
     lines = []
@@ -303,7 +319,7 @@ def render_game_ini(existing, values, rcon_password, rcon_port, queue_port):
                 lines.append(line)
         lines += key_lines(mine)
         lines.append("")
-    for section in (SESSION, STATE_BASE):
+    for section in (SESSION, STATE_BASE, ENGINE_SESSION):
         if section not in seen:
             lines.append(f"[{section}]")
             lines += key_lines(owned[section])
@@ -334,22 +350,41 @@ def rcon_password():
     return value
 
 
+def ban_steam_id(entry):
+    """The banned player's SteamID64 in one PlayerBans.json entry ("steamId", measured)."""
+    if isinstance(entry, dict):
+        for key in ("steamId", "SteamId", "steamID", "SteamID", "playerSteamId"):
+            if key in entry:
+                return str(entry[key])
+    return None
+
+
+def ban_entries(data):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("bannedPlayerData") if isinstance(data.get("bannedPlayerData"), list) else \
+            next((v for v in data.values() if isinstance(v, list)), [])
+    return []
+
+
 def apply_unbans(notes):
     pending = read_json(UNBAN_FILE)
     if not isinstance(pending, list) or not pending:
         return
     data = read_json(BANS_FILE)
     if isinstance(data, (list, dict)):
-        entries = data if isinstance(data, list) else next((v for v in data.values() if isinstance(v, list)), [])
+        entries = ban_entries(data)
         before = len(entries)
-        kept = [e for e in entries if not any(str(i) in json.dumps(e) for i in pending)]
+        # Exactly the banned player's own id: an entry also names the admin who banned
+        # (bannerSteamId), and lifting a ban must never lift every ban that admin made.
+        kept = [e for e in entries if ban_steam_id(e) not in {str(i) for i in pending}]
         if isinstance(data, list):
             data = kept
         else:
-            for k, v in data.items():
-                if isinstance(v, list):
-                    data[k] = kept
-                    break
+            key = "bannedPlayerData" if isinstance(data.get("bannedPlayerData"), list) else \
+                next((k for k, v in data.items() if isinstance(v, list)), "bannedPlayerData")
+            data[key] = kept
         write_json(BANS_FILE, data)
         notes.append(f"bans lifted: {before - len(kept)}")
     try:
@@ -418,15 +453,29 @@ def strip_stamp(text):
 
 
 def parse_players(text):
-    """PlayerList: SteamID64 and name pairs after the header, each field ended by a comma (the
-    community's protocol notes; separators between players are not documented, so this reads any
-    run of "<17-digit id>" then "<name>")."""
+    """PlayerList: the SteamID64s and names of the players online.
+
+    The reply's layout with players online is NOT measured (no player ever joined a test server).
+    The community's protocol notes show "PlayerList\n<SteamID>,\n<name>,\n" for one player, which
+    is ambiguous between two layouts, both read here:
+      - pairs: an id then its name, player after player ("<id>,\n<name>,\n<id>,\n<name>,")
+      - columns: every id, then every name in the same order ("<id>,<id>,\n<name>,<name>,")
+    Fields end with a comma; a name never is a 17-digit 7656119... number."""
     body = text.split("PlayerList", 1)[-1]
     tokens = [t.strip() for t in re.split(r"[,\n]", body) if t.strip()]
+    is_id = [bool(re.fullmatch(r"7656119\d{10}", t)) for t in tokens]
+    ids = [t for t, flag in zip(tokens, is_id) if flag]
+    names = [t for t, flag in zip(tokens, is_id) if not flag]
+    if not ids:
+        return []
+    first_name = next((i for i, flag in enumerate(is_id) if not flag), len(tokens))
+    if len(ids) > 1 and first_name >= len(ids) and len(names) == len(ids):
+        # columns: all the ids come before the first name
+        return [{"id": i, "name": n} for i, n in zip(ids, names)]
     players, i = [], 0
     while i < len(tokens):
-        if re.fullmatch(r"7656119\d{10}", tokens[i]):
-            name = tokens[i + 1] if i + 1 < len(tokens) and not re.fullmatch(r"7656119\d{10}", tokens[i + 1]) else ""
+        if is_id[i]:
+            name = tokens[i + 1] if i + 1 < len(tokens) and not is_id[i + 1] else ""
             players.append({"id": tokens[i], "name": name})
             i += 2 if name else 1
         else:
@@ -449,6 +498,13 @@ def cmd_rcon(name, *args):
     if takes and not arg:
         fail(f"{name} needs an argument", 64)
     arg = re.sub(r"[\x00-\x1f\x7f]", " ", arg)[:500]
+    if name == "dm":
+        # "<steamid>,<message>": the message must not hold the separator, or the server may cut it
+        # (or read the rest as more fields). Commas in the message become semicolons.
+        target, _, message = arg.partition(",")
+        arg = f"{target.strip()},{message.replace(',', ';').strip()}"
+    elif name in ("announce",):
+        arg = arg.strip()
     try:
         reply = rcon([(op, arg)])[0]
     except (OSError, RuntimeError) as e:
@@ -507,6 +563,7 @@ def cmd_status():
         "image": state.get("image"), "build": installed_build(), "map": "Gateway",
         "name": values["serverName"], "players": players, "max_players": values["maxPlayers"],
         "queue": queue, "rcon": rcon_ok, "pending": changes_pending(state),
+        "legacyData": legacy_present(), "migrated": read_json(MIGRATION_FILE),
     })
 
 
@@ -605,12 +662,218 @@ def cmd_restart():
     out({"ok": True})
 
 
+# ------------------------------------------------------------------------------------------------
+# The previous image's layout: migrated on the first start of this one
+# ------------------------------------------------------------------------------------------------
+
+# What the previous image's synced install leaves on our data volume: the game, never data.
+LEGACY_INSTALL = ("TheIsle", "Engine", "steamapps", "TheIsleServer.sh")
+LEGACY_INSTALL_GLOBS = (r"^Manifest_\w+_Linux\.txt$",)
+
+
+def legacy_present():
+    return os.path.isdir(LEGACY_SAVED) or any(
+        os.path.exists(os.path.join(DATA_DIR, n)) for n in ("Engine", "steamapps", "TheIsleServer.sh"))
+
+
+def import_game_ini(text, settings, notes):
+    """Every setting the old Game.ini holds that the panel does not already have: the owner's
+    server keeps its name, rules, admins, classes and lists across the move."""
+    sections = parse_ini(text)
+    found = {}
+    for section, body in sections:
+        if section is None:
+            continue
+        for line in body:
+            if "=" not in line or line.lstrip().startswith((";", "#", "//")):
+                continue
+            key, _, value = line.partition("=")
+            found.setdefault((section.strip(), key.strip().lstrip("+-.!")), []).append(value.strip().strip('"'))
+    imported = []
+    for name, (section, key, kind, _) in SETTINGS.items():
+        values = found.get((section, key))
+        if not values or name in settings:
+            continue
+        try:
+            settings[name] = coerce(name, values if kind == "list" else values[-1])
+            imported.append(name)
+        except ValueError:
+            notes.append(f"WARN the old Game.ini's {key}={values[-1]!r} could not be kept")
+    return imported
+
+
+def import_additional_commands(value, settings):
+    """The previous image's `additionalcommands` env: -ini:Game:[section]:Key=Value overrides
+    (ServerName, MaxPlayerCount, bQueueEnabled... set by the old marketplace spec)."""
+    by_key = {(sec, key): name for name, (sec, key, _, _) in SETTINGS.items()}
+    imported = []
+    for sec, key, val in re.findall(r"-ini:Game:\[([^\]]+)\]:([A-Za-z0-9_]+)=(\S+)", value or ""):
+        name = by_key.get((sec, key))
+        if name and name not in settings:
+            try:
+                settings[name] = coerce(name, val)
+                imported.append(name)
+            except ValueError:
+                pass
+    return imported
+
+
+def cmd_migrate_legacy():
+    """Moves a server from the previous image's layout, once and idempotently:
+      1. a safety backup of the old saves (flux/backups/<date>-theisle-legacy.tar.gz)
+      2. the old Game.ini's settings (and the old env's -ini overrides) into the panel's settings
+      3. TheIsle/Saved -> Saved: the player database, Game.ini, bans. If Saved already holds a
+         player database (this image ran before), the old one is kept aside, never merged
+      4. the old install (Engine/, TheIsle/, steamapps/...) removed from the SYNCED volume: it is
+         the game, re-downloaded onto the local volume, and 1.5 GB of it synced for nothing."""
+    notes = []
+    if not legacy_present():
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    settings = load_settings()
+    if os.path.isdir(LEGACY_SAVED) and not os.path.islink(LEGACY_SAVED):
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        archive = os.path.join(BACKUP_DIR, f"{stamp}-theisle-legacy.tar.gz")
+        r = subprocess.run(["tar", "-C", os.path.dirname(LEGACY_SAVED), "--exclude=Saved/Logs", "--exclude=Saved/Demos",
+                            "--exclude=Saved/Crashes", "-czf", archive + ".part", "Saved"], capture_output=True)
+        if r.returncode in (0, 1) and os.path.getsize(archive + ".part") > 0:
+            os.replace(archive + ".part", archive)
+            notes.append(f"legacy: safety backup flux/backups/{os.path.basename(archive)}")
+        else:
+            try:
+                os.remove(archive + ".part")
+            except OSError:
+                pass
+            print("# ERROR legacy: the safety backup of the old saves failed; nothing moved")
+            sys.exit(2)
+        old_ini = os.path.join(LEGACY_SAVED, "Config", "LinuxServer", "Game.ini")
+        try:
+            imported = import_game_ini(open(old_ini, encoding="utf-8-sig", errors="replace").read(), settings, notes)
+        except OSError:
+            imported = []
+        imported += import_additional_commands(os.environ.get("additionalcommands", ""), settings)
+        if imported:
+            write_json(SETTINGS_FILE, settings)
+            notes.append(f"legacy: settings kept from the old server: {', '.join(sorted(set(imported)))}")
+        os.makedirs(SAVED_DIR, exist_ok=True)
+        new_db = os.path.join(SAVED_DIR, "PlayerData", "TheIslePersistence.db")
+        if os.path.exists(new_db) and os.path.exists(os.path.join(LEGACY_SAVED, "PlayerData")):
+            aside = os.path.join(STATE_DIR, f"legacy-saved-{stamp}")
+            shutil.move(LEGACY_SAVED, aside)
+            notes.append(f"legacy: this server already has a player database; the old saves are kept in flux/{os.path.basename(aside)}")
+        else:
+            for child in os.listdir(LEGACY_SAVED):
+                src, dst = os.path.join(LEGACY_SAVED, child), os.path.join(SAVED_DIR, child)
+                if os.path.isdir(src) and os.path.isdir(dst):
+                    for root, dirs, files in os.walk(src):
+                        rel = os.path.relpath(root, src)
+                        os.makedirs(os.path.join(dst, rel), exist_ok=True)
+                        for f in files:
+                            os.replace(os.path.join(root, f), os.path.join(dst, rel, f))
+                else:
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst) if os.path.isdir(dst) and not os.path.islink(dst) else os.remove(dst)
+                    shutil.move(src, dst)
+            shutil.rmtree(LEGACY_SAVED, ignore_errors=True)
+            notes.append("legacy: the player database, Game.ini and bans moved to Saved/")
+    removed = []
+    for name in os.listdir(DATA_DIR):
+        path = os.path.join(DATA_DIR, name)
+        if name in LEGACY_INSTALL or any(re.match(g, name) for g in LEGACY_INSTALL_GLOBS):
+            if name == "TheIsle" and os.path.isdir(os.path.join(path, "Saved")) and not os.path.islink(os.path.join(path, "Saved")):
+                continue  # never delete saves that were not moved
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            removed.append(name)
+    if removed:
+        notes.append(f"legacy: the old install removed from the synced volume ({', '.join(sorted(removed))})")
+    write_json(MIGRATION_FILE, {"at": int(time.time()), "notes": notes})
+    for note in notes:
+        print(f"# {note}")
+
+
+# ------------------------------------------------------------------------------------------------
+# Backups and restore
+# ------------------------------------------------------------------------------------------------
+
+BACKUP_RE = re.compile(r"^(\d{8}-\d{6})-theisle(?:-([a-z-]+))?\.tar\.gz$")
+
+
+def list_backups():
+    items = []
+    if os.path.isdir(BACKUP_DIR):
+        for name in os.listdir(BACKUP_DIR):
+            m = BACKUP_RE.match(name)
+            if not m:
+                continue
+            st = os.stat(os.path.join(BACKUP_DIR, name))
+            items.append({"name": name, "size": st.st_size, "at": int(st.st_mtime), "why": m.group(2) or "backup"})
+    return sorted(items, key=lambda b: b["name"], reverse=True)
+
+
+def cmd_backups():
+    out({"backups": list_backups(), "path": "flux/backups"})
+
+
+def backups_to_prune(backups, keep, now):
+    """backups: [{"name", "at"}] (any order). The ones to delete: everything but the newest `keep`,
+    the newest one older than a day and the newest older than a week (a crash loop can never rotate
+    every good backup away), and the previous image's safety backup (made once)."""
+    ordered = sorted(backups, key=lambda b: b["name"], reverse=True)
+    kept = {b["name"] for b in ordered[:max(keep, 1)]}
+    for age in (86400, 7 * 86400):
+        older = next((b for b in ordered if now - b["at"] >= age), None)
+        if older:
+            kept.add(older["name"])
+    kept |= {b["name"] for b in ordered if b["name"].endswith("-legacy.tar.gz")}
+    return [b["name"] for b in ordered if b["name"] not in kept]
+
+
+def cmd_prune_backups(keep):
+    for name in backups_to_prune(list_backups(), int(keep), int(time.time())):
+        try:
+            os.remove(os.path.join(BACKUP_DIR, name))
+            print(f"# backup pruned: flux/backups/{name}")
+        except OSError:
+            pass
+
+
+def cmd_restore(name):
+    """Asks the supervisor to restore a backup: it stops the server (a clean shutdown writes the
+    database), keeps a safety backup of what is there now, puts the backup in place and starts."""
+    if not BACKUP_RE.match(name or "") or os.path.basename(name) != name:
+        fail("not a backup name (see flux-isle backups)", 2)
+    if not os.path.isfile(os.path.join(BACKUP_DIR, name)):
+        fail("no such backup", 2)
+    with open(RESTORE_MARKER, "w") as f:
+        f.write(name + "\n")
+    pids = subprocess.run(["pgrep", "-f", r"TheIsleServer-Linux-Shipping TheIsle "], capture_output=True, text=True).stdout.split()
+    if pids:
+        with open(os.environ.get("FLUX_RESTART_MARKER", "/tmp/flux-restart-requested"), "w") as f:
+            f.write(f"requested: restore {name}\n")
+        import signal
+        for pid in pids:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+    out({"ok": True, "restore": name, "appliesOn": "now" if pids else "next start"})
+
+
 def main(argv):
     commands = {
         "apply": (cmd_apply, (0,)), "state": (cmd_state, (1, 2)), "rcon-password": (lambda: print(rcon_password()), (0,)),
         "status": (cmd_status, (0,)), "rcon": (cmd_rcon, tuple(range(1, 10))), "settings": (cmd_settings, (0,)),
         "set-settings": (cmd_set_settings, (1,)), "bans": (cmd_bans, (0,)), "unban": (cmd_unban, (1,)),
-        "restart": (cmd_restart, (0,)),
+        "restart": (cmd_restart, (0,)), "backups": (cmd_backups, (0,)), "restore": (cmd_restore, (1,)),
+        "prune-backups": (cmd_prune_backups, (1,)),
+        "migrate-legacy": (cmd_migrate_legacy, (0,)),
     }
     if not argv or argv[0] not in commands or len(argv) - 1 not in commands[argv[0]][1]:
         print(__doc__, file=sys.stderr)

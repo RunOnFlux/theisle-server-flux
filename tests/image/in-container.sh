@@ -78,6 +78,10 @@ STUB
 chmod +x /usr/local/bin/steamcmd
 
 data=/mnt/isle/data
+# A volume from the previous image (ghcr.io/auhrus/theisleevrima): the whole install, saves inside.
+mkdir -p "${data}/TheIsle/Saved/PlayerData" "${data}/TheIsle/Saved/Config/LinuxServer" "${data}/Engine/Binaries" "${data}/steamapps"
+echo legacy >"${data}/TheIsle/Saved/PlayerData/TheIslePersistence.db"
+printf '[/Script/TheIsle.TIGameSession]\nbEnableHumans=true\n' >"${data}/TheIsle/Saved/Config/LinuxServer/Game.ini"
 export FLUX_RESTART_BACKOFF=1 FLUX_UPDATE_CHECK_MINUTES=0 ISLE_SERVER_NAME="Image Test"
 /opt/flux/flux-entrypoint.sh >/tmp/entry.log 2>&1 &
 entry=$!
@@ -85,6 +89,10 @@ check "the server comes up (its RCON answers)" "0" "$(status wait_for 'grep -q "
 check "as uid 1000" "1000" "$(ps -o uid= -p "$(pgrep -f 'TheIsleServer-Linux-Shipping TheIsle ')" | tr -d ' ')"
 check "with the EOS client" "1" "$(pgrep -af 'TheIsleServer-Linux-Shipping TheIsle ' | grep -c 'DedicatedServerClientId=xyza7891')"
 check "Saved/ is the data volume" "${data}/Saved" "$(readlink /mnt/isle/server/TheIsle/Saved)"
+check "the previous image's player database was moved in" "legacy" "$(head -1 "${data}/Saved/PlayerData/TheIslePersistence.db")"
+check "and its settings kept" "true" "$(sed -n 's/^bEnableHumans=//p' "${data}/Saved/Config/LinuxServer/Game.ini")"
+check "and its install removed from the data volume" "1" "$(status test -e "${data}/Engine")"
+check "with a safety backup" "0" "$(status bash -c "ls ${data}/flux/backups/*-theisle-legacy.tar.gz")"
 check "status over RCON" "True []" "$(flux-isle status | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["rcon"], d["players"])')"
 check "an RCON command" "Game saved" "$(flux-isle rcon save | python3 -c 'import json,sys;print(json.load(sys.stdin)["reply"])')"
 
@@ -93,12 +101,22 @@ flux-isle restart >/dev/null
 check "a panel restart writes the database" "0" "$(status wait_for 'test -s ${data}/Saved/PlayerData/TheIslePersistence.db' 20)"
 check "and comes back with the new setting" "0" "$(status wait_for 'grep -q "^Discord=https://discord.gg/flux" ${data}/Saved/Config/LinuxServer/Game.ini && grep -q "\"running\"" ${data}/flux/state.json' 40)"
 check "not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
-check "a backup on the second start" "0" "$(status wait_for 'ls ${data}/flux/backups/*-theisle.tar.gz' 5)"
+check "a start backup is skipped when a recent one exists" "0" "$(status grep -q 'backup (start): skipped' /tmp/entry.log)"
+
+# Restore: the newest backup, while the server runs.
+backup="$(flux-isle backups | python3 -c 'import json,sys;print(json.load(sys.stdin)["backups"][0]["name"])')"
+export saved_lines
+saved_lines="$(tar -xzOf "${data}/flux/backups/${backup}" Saved/PlayerData/TheIslePersistence.db | wc -l)"
+echo "after the backup" >>"${data}/Saved/PlayerData/TheIslePersistence.db"
+flux-isle restore "${backup}" >/dev/null
+check "a restore puts the backup in place" "0" "$(status wait_for '[ "$(wc -l <${data}/Saved/PlayerData/TheIslePersistence.db)" = "${saved_lines}" ] && grep -q "\"running\"" ${data}/flux/state.json' 40)"
+check "after a safety backup of what was there" "0" "$(status bash -c "ls ${data}/flux/backups/*-theisle-pre-restore.tar.gz")"
+check "the restore was not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
 
 kill -TERM "${entry}"
 check "a stop ends the supervisor" "0" "$(status wait_for '! kill -0 ${entry} 2>/dev/null' 20)"
 check "and says stopped" "stopped" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/flux/state.json"))["state"])')"
-check "the database was written twice" "2" "$(wc -l <"${data}/Saved/PlayerData/TheIslePersistence.db")"
+check "the database was written on every stop" "0" "$(status grep -q saved "${data}/Saved/PlayerData/TheIslePersistence.db")"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ] || { echo '--- entrypoint log'; cat /tmp/entry.log; exit 1; }
