@@ -143,5 +143,56 @@ mig >/dev/null
 check "an existing database is never overwritten" "db" "$(cat "${old}/Saved/PlayerData/TheIslePersistence.db")"
 check "the old one is kept aside" "old2" "$(cat "${old}"/flux/legacy-saved-*/PlayerData/TheIslePersistence.db)"
 
+# --- 1.0.3 ---------------------------------------------------------------------------------------
+# Players: one line per field, the EOS line is not a name, and a name with a comma never shifts one.
+pl() { py "print(' '.join(p['id']+':'+p['name'] for p in t.parse_players($1)))"; }
+check "columns, with the EOS line" "76561197960287930:Rex 76561197960287931:Bob" "$(pl '"PlayerList\n76561197960287930,76561197960287931,\nRex,Bob,\n0002a1b2c3d4e5f60718293a4b5c6d7e,0002a1b2c3d4e5f60718293a4b5c6d7f,\n"')"
+check "one player with the EOS line" "76561197960287930:Rex" "$(pl '"PlayerList\n76561197960287930,\nRex,\n0002a1b2c3d4e5f60718293a4b5c6d7e,\n"')"
+check "a comma in a name: no names rather than wrong ones" "76561197960287930: 76561197960287931:" "$(pl '"PlayerList\n76561197960287930,76561197960287931,\nRe,x,Bob,\nabc,def,\n"')"
+check "an empty name keeps its place" "76561197960287930: 76561197960287931:Bob" "$(pl '"PlayerList\n76561197960287930,76561197960287931,\n,Bob,\n"')"
+check "per-player lines: a whole line is one name" "76561197960287930:Rex, the T 76561197960287931:Bob" "$(pl '"PlayerList\n76561197960287930,\nRex, the T,\n76561197960287931,\nBob,\n"')"
+
+# Mutations: the struct the game reads (the "Name, value" form is refused: ImportText, measured).
+check "mutations are written as the struct" '(MutationName="Hemomania",EffectValue=0.05) (MutationName="Pit Organ",EffectValue=1)' \
+  "$(isle set-settings '{"enabledMutations": ["Hemomania, 0.05", {"name": "Pit Organ", "value": 1}]}' >/dev/null; isle apply >/dev/null; iniv EnabledMutations | tr '\n' ' ' | sed 's/ $//')"
+check "in the game state section" "[/Script/TheIsle.TIGameStateBase]" "$(awk '/^\[/{s=$0} /^EnabledMutations=/{print s; exit}' "${ini}")"
+check "a struct comes back the same" '["(MutationName=\"Hematophagy\",EffectValue=0.25)"]' "$(py 'import json; print(json.dumps(t.coerce("enabledMutations", ["(MutationName=\"Hematophagy\",EffectValue=0.25)"])))')"
+check "a list saved in the old form is read as the struct" '(MutationName="Wader",EffectValue=0.25)' \
+  "$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));d["enabledMutations"]=["Wader, 0.25"];json.dump(d,open(sys.argv[1],"w"))' "${data}/flux/settings.json"; isle apply >/dev/null; iniv EnabledMutations)"
+check "a mutation that cannot be read is refused" "2" "$(status isle set-settings '{"enabledMutations": ["Hemomania"]}')"
+
+# Commas inside kick and ban texts become semicolons; the SteamID and the hours are found by shape.
+check "kick reason commas" "76561197960287930,spam; spam" "$(PYTHONPATH=scripts python3 - <<'EOF'
+import fluxisle as t
+sent = []
+t.rcon = lambda cmds: sent.extend(cmds) or [""]
+t.out = lambda d: None
+t.cmd_rcon("kick", "76561197960287930,spam, spam")
+print(sent[0][1])
+EOF
+)"
+check "ban fields" "Rex;Jr,76561197960287930,grief;spam,24" "$(PYTHONPATH=scripts python3 - <<'EOF'
+import fluxisle as t
+sent = []
+t.rcon = lambda cmds: sent.extend(cmds) or [""]
+t.out = lambda d: None
+t.cmd_rcon("ban", "Rex,Jr,76561197960287930,grief, spam,24")
+print(sent[0][1])
+EOF
+)"
+check "a ban without hours is refused" "64" "$(status isle rcon ban Rex,76561197960287930,reason)"
+
+# Unban by the id in either of the player's own fields, never the banner's.
+printf '{"bannedPlayerData": [{"steamId": "Rex", "playerName": "76561197960287930", "bannerSteamId": "76561197960287999"}, {"steamId": "76561197960287999", "playerName": "Admin"}]}' >"${data}/Saved/PlayerData/PlayerBans.json"
+isle unban 76561197960287930 >/dev/null
+isle apply >/dev/null
+check "unban when the id is in playerName" "76561197960287999" "$(python3 -c 'import json,sys;print(",".join(b["steamId"] for b in json.load(open(sys.argv[1]))["bannedPlayerData"]))' "${data}/Saved/PlayerData/PlayerBans.json")"
+
+# The join password only when asked for.
+isle set-settings '{"password": "pw9"}' >/dev/null
+check "settings leave the password out" "" "$(isle settings | python3 -c 'import json,sys;print(json.load(sys.stdin)["values"]["password"])')"
+check "but say one is set" "True" "$(isle settings | python3 -c 'import json,sys;print(json.load(sys.stdin)["passwordSet"])')"
+check "settings password includes it" "pw9" "$(isle settings password | python3 -c 'import json,sys;print(json.load(sys.stdin)["values"]["password"])')"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ]

@@ -75,7 +75,7 @@ The panel has every other setting: see `SETTINGS` in `scripts/fluxisle.py`.
 |---|---|
 | `flux-isle status` | `state`, `players` (`id`, `name`), `max_players`, `queue`, `build`, `rcon` (answering), `pending` |
 | `flux-isle rcon <command> [args]` | `announce <text>`, `dm <steamid>,<text>`, `kick <steamid>`, `ban <name>,<steamid>,<reason>,<hours>`, `players`, `playerdata`, `save`, `wipecorpses`, `playables`, `addplayable`/`removeplayable <class>`, `addwhitelist`/`removewhitelist <ids>`, `togglewhitelist`, `toggleglobalchat`, `togglehumans`, `toggleai`, `togglemigrations`, `togglegrowth`, `growth <x>`, `aidensity <x>`, `disableai <classes>`, `queue` |
-| `flux-isle settings` / `set-settings '<json>'` | every Game.ini setting with where its value comes from; AI density and AI classes also reach the running server |
+| `flux-isle settings [password]` / `set-settings '<json>'` | every Game.ini setting with where its value comes from (the join password only with `password`); AI density and AI classes also reach the running server |
 | `flux-isle bans` / `unban <steamid>` | `PlayerBans.json`; an unban is applied on the next start (the server owns the file) |
 | `flux-isle restart` | save, stop and start again |
 | `flux-isle backups` / `restore <name>` | the backups; a restore stops the server, keeps a `-pre-restore` backup of the current state, puts the archive in place and starts |
@@ -112,6 +112,14 @@ Bans are in hours: 0 expires at once, so there is no permanent ban; use a large 
 
 ## Versions
 
+- **1.0.3** (2026-10-16): EnabledMutations written as the struct the game reads,
+  `(MutationName="Hemomania",EffectValue=0.05)`; the "Hemomania, 0.05" form 1.0.2 wrote is refused
+  by the engine ("ImportText (EnabledMutations): Missing opening parenthesis", measured on build
+  24664709), and a list saved in it is read as the struct; the player list read line by line, one
+  line per field with the EOS ids last, and no names at all rather than shifted ones when a name
+  holds a comma; commas inside kick and ban texts become semicolons; an unban finds the id in
+  either of the player's own fields; `flux-isle settings` leaves the join password out unless
+  asked for (`settings password`).
 - **1.0.2** (2026-10-11): the previous image's servers are moved on their first start (saves,
   settings, the old install off the synced volume); backups taken from a copy after a save, skipped
   when one is under an hour old, older generations kept; `flux-isle backups` / `restore`; an update

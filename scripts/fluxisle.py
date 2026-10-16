@@ -7,7 +7,8 @@
 
     flux-isle status                   state, players, queue, version (one JSON document)
     flux-isle rcon <op> [args]         one RCON command by name (see OPS), its reply as JSON
-    flux-isle settings                 the panel's settings, the env that overrides them, the choices
+    flux-isle settings [password]      the panel's settings, the env that overrides them, the choices
+                                       (the join password only with `password`)
     flux-isle set-settings '<json>'    save settings; the ones RCON can change are applied live too
     flux-isle bans                     PlayerBans.json
     flux-isle unban <steamid>          lifted on the next start (the server owns the file while it runs)
@@ -219,6 +220,8 @@ def coerce(name, value):
         if not 0 <= f <= 100:
             raise ValueError(f"{name} must be from 0 to 100")
         return f
+    if name == "enabledMutations":
+        return mutation_entries(value)
     if kind in ("list", "csv"):
         items = value if isinstance(value, list) else re.split(r"[\n,;]+", str(value or ""))
         items = [re.sub(r"[\x00-\x1f\x7f=]", "", str(i)).strip() for i in items]
@@ -232,6 +235,47 @@ def coerce(name, value):
         return list(dict.fromkeys(items))
     text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value)).strip()
     return text[:100 if name != "discord" else 200]
+
+
+MUTATION_STRUCT = re.compile(r'^\(\s*MutationName\s*=\s*"?([^",)]+?)"?\s*,\s*EffectValue\s*=\s*([0-9]*\.?[0-9]+)\s*\)$', re.I)
+MUTATION_PAIR = re.compile(r"^([A-Za-z][A-Za-z ]{1,60}?)\s*,\s*([0-9]*\.?[0-9]+)$")
+
+
+def mutation_entry(name, value):
+    name = str(name).strip()
+    if not re.fullmatch(r"[A-Za-z][A-Za-z ]{1,60}", name):
+        raise ValueError(f"enabledMutations: {name!r} is not a mutation name")
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"enabledMutations: {name} needs a number") from None
+    if not 0 <= v <= 100:
+        raise ValueError(f"enabledMutations: {name} must be from 0 to 100")
+    return f'(MutationName="{name}",EffectValue={v:g})'
+
+
+def mutation_entries(value):
+    """EnabledMutations as the game reads it: one `(MutationName="Hemomania",EffectValue=0.05)`
+    per line, in [/Script/TheIsle.TIGameStateBase]. MEASURED on build 24664709: the
+    "Hemomania, 0.05" form (the CubeCoders template's, and what 1.0.2 wrote) is refused by the
+    engine, "ImportText (EnabledMutations): Missing opening parenthesis", so the list was empty.
+    Taken in either form, or as {"name", "value"}, and always written as the struct."""
+    items = value if isinstance(value, list) else [i for i in re.split(r"[\n;]+", str(value or "")) if i.strip()]
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            entry = mutation_entry(item.get("name", ""), item.get("value", item.get("chance")))
+        else:
+            text = re.sub(r"[\x00-\x1f\x7f]", "", str(item)).strip()
+            if not text:
+                continue
+            m = MUTATION_STRUCT.match(text) or MUTATION_PAIR.match(text)
+            if not m:
+                raise ValueError(f"enabledMutations: cannot read {text!r}")
+            entry = mutation_entry(m.group(1), m.group(2))
+        if entry not in out:
+            out.append(entry)
+    return out
 
 
 def effective_settings(settings=None):
@@ -250,6 +294,12 @@ def effective_settings(settings=None):
                 pass
         if name in settings:
             values[name] = settings[name]
+            if name == "enabledMutations":
+                # A list saved by 1.0.2 is in the form the game refuses; read it as the struct.
+                try:
+                    values[name] = mutation_entries(settings[name])
+                except ValueError:
+                    values[name] = []
             sources[name] = "panel"
         else:
             values[name] = default
@@ -359,6 +409,18 @@ def ban_steam_id(entry):
     return None
 
 
+def banned_ids(entry):
+    """The SteamID64s that name the BANNED player in an entry: its id field, and its name field
+    when that holds a SteamID64. Never bannerSteamId."""
+    ids = set()
+    sid = ban_steam_id(entry)
+    if sid:
+        ids.add(sid)
+    if isinstance(entry, dict) and STEAM_ID.fullmatch(str(entry.get("playerName", ""))):
+        ids.add(str(entry["playerName"]))
+    return ids
+
+
 def ban_entries(data):
     if isinstance(data, list):
         return data
@@ -377,8 +439,11 @@ def apply_unbans(notes):
         entries = ban_entries(data)
         before = len(entries)
         # Exactly the banned player's own id: an entry also names the admin who banned
-        # (bannerSteamId), and lifting a ban must never lift every ban that admin made.
-        kept = [e for e in entries if ban_steam_id(e) not in {str(i) for i in pending}]
+        # (bannerSteamId), and lifting a ban must never lift every ban that admin made. The id is
+        # read from either of the player's own fields, because the panel shows whichever of
+        # steamId and playerName holds one (both layouts have been seen in protocol notes).
+        lift = {str(i) for i in pending}
+        kept = [e for e in entries if not (banned_ids(e) & lift)]
         if isinstance(data, list):
             data = kept
         else:
@@ -452,35 +517,55 @@ def strip_stamp(text):
     return re.sub(r"^\[\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}\]\s*", "", text.strip())
 
 
+STEAM_ID = re.compile(r"7656119\d{10}")
+
+
+def reply_fields(line):
+    """One line of a reply's fields: "a,b,c," -> ["a", "b", "c"]. Only the LAST comma is the
+    terminator, so an empty field in the middle (a blank name) keeps its place."""
+    line = line.strip()
+    if line.endswith(","):
+        line = line[:-1]
+    return [f.strip() for f in line.split(",")]
+
+
 def parse_players(text):
     """PlayerList: the SteamID64s and names of the players online.
 
-    The reply's layout with players online is NOT measured (no player ever joined a test server).
-    The community's protocol notes show "PlayerList\n<SteamID>,\n<name>,\n" for one player, which
-    is ambiguous between two layouts, both read here:
-      - pairs: an id then its name, player after player ("<id>,\n<name>,\n<id>,\n<name>,")
-      - columns: every id, then every name in the same order ("<id>,<id>,\n<name>,<name>,")
-    Fields end with a comma; a name never is a 17-digit 7656119... number."""
+    The layout is one line per FIELD, every player in the same order on each (the community
+    clients read it so, e.g. the isle-evrima-rcon package):
+        PlayerList
+        <id>,<id>,
+        <name>,<name>,
+        <EOS id>,<EOS id>,
+    The EOS line is not a name. A name holding a comma makes the names line longer than the ids
+    line, and then which name is whose cannot be known: every name is left out (the panel shows the
+    SteamID) rather than one being paired with the wrong player, since kick and ban act on the id.
+    Older protocol notes show one field per line for each player ("<id>,\n<name>,\n" again and
+    again); that is read too, a whole line being one name, commas and all."""
     body = text.split("PlayerList", 1)[-1]
-    tokens = [t.strip() for t in re.split(r"[,\n]", body) if t.strip()]
-    is_id = [bool(re.fullmatch(r"7656119\d{10}", t)) for t in tokens]
-    ids = [t for t, flag in zip(tokens, is_id) if flag]
-    names = [t for t, flag in zip(tokens, is_id) if not flag]
-    if not ids:
+    lines = [line for line in body.splitlines() if line.strip()]
+    if not lines:
         return []
-    first_name = next((i for i, flag in enumerate(is_id) if not flag), len(tokens))
-    if len(ids) > 1 and first_name >= len(ids) and len(names) == len(ids):
-        # columns: all the ids come before the first name
-        return [{"id": i, "name": n} for i, n in zip(ids, names)]
-    players, i = [], 0
-    while i < len(tokens):
-        if is_id[i]:
-            name = tokens[i + 1] if i + 1 < len(tokens) and not is_id[i + 1] else ""
-            players.append({"id": tokens[i], "name": name})
-            i += 2 if name else 1
-        else:
-            i += 1
-    return players
+    first = reply_fields(lines[0])
+    if not first or not all(STEAM_ID.fullmatch(f) for f in first):
+        return []
+    one_id_line = lambda line: (lambda f: len(f) == 1 and bool(STEAM_ID.fullmatch(f[0])))(reply_fields(line))
+    if len(first) == 1 and len(lines) >= 3 and one_id_line(lines[2]):
+        players, i = [], 0
+        while i < len(lines):
+            if one_id_line(lines[i]):
+                nxt = lines[i + 1] if i + 1 < len(lines) and not one_id_line(lines[i + 1]) else None
+                name = nxt.strip()[:-1].strip() if nxt is not None and nxt.strip().endswith(",") else (nxt or "").strip()
+                players.append({"id": reply_fields(lines[i])[0], "name": name})
+                i += 2 if nxt is not None else 1
+            else:
+                i += 1
+        return players
+    names = reply_fields(lines[1]) if len(lines) > 1 else []
+    if len(names) != len(first) or any(STEAM_ID.fullmatch(n) for n in names):
+        names = [""] * len(first)
+    return [{"id": i, "name": n} for i, n in zip(first, names)]
 
 
 def parse_queue(text):
@@ -498,11 +583,19 @@ def cmd_rcon(name, *args):
     if takes and not arg:
         fail(f"{name} needs an argument", 64)
     arg = re.sub(r"[\x00-\x1f\x7f]", " ", arg)[:500]
-    if name == "dm":
-        # "<steamid>,<message>": the message must not hold the separator, or the server may cut it
-        # (or read the rest as more fields). Commas in the message become semicolons.
+    if name in ("dm", "kick"):
+        # "<steamid>,<text>": the text must not hold the separator, or the server may cut it (or
+        # read the rest as more fields). Commas in it become semicolons.
         target, _, message = arg.partition(",")
         arg = f"{target.strip()},{message.replace(',', ';').strip()}"
+    elif name == "ban":
+        # "<name>,<steamid>,<reason>,<hours>": the SteamID and the hours are found by shape, and
+        # commas anywhere else (a name, a reason typed with commas) become semicolons.
+        parts = [p.strip() for p in arg.split(",")]
+        at = next((i for i, p in enumerate(parts) if STEAM_ID.fullmatch(p)), None)
+        if at is None or len(parts) < at + 3 or not re.fullmatch(r"\d{1,6}", parts[-1]):
+            fail("ban needs name,SteamID64,reason,hours", 64)
+        arg = ",".join([";".join(parts[:at]) or "Player", parts[at], ";".join(parts[at + 1:-1]) or "Banned by an admin", parts[-1]])
     elif name in ("announce",):
         arg = arg.strip()
     try:
@@ -571,11 +664,16 @@ def cmd_status():
 # Panel: settings, bans, restart
 # ------------------------------------------------------------------------------------------------
 
-def cmd_settings():
+def cmd_settings(*what):
+    """The settings. The join password is in it only when asked for (`settings password`, the
+    Server Settings tab): the console and the other tabs read this every few seconds and have no
+    use for it."""
     values, sources = effective_settings()
     values = dict(values)
     if sources.get("password") == "env":
         values["password"] = "(set in Deployment Settings)" if values["password"] else ""
+    elif what != ("password",):
+        values["password"] = ""
     out({"values": values, "sources": sources, "panel": {k: v for k, v in load_settings().items() if k != "password"},
          "passwordSet": bool(effective_settings()[0]["password"]),
          "choices": {"playables": PLAYABLES, "aiClasses": AI_CLASSES},
@@ -869,7 +967,7 @@ def cmd_restore(name):
 def main(argv):
     commands = {
         "apply": (cmd_apply, (0,)), "state": (cmd_state, (1, 2)), "rcon-password": (lambda: print(rcon_password()), (0,)),
-        "status": (cmd_status, (0,)), "rcon": (cmd_rcon, tuple(range(1, 10))), "settings": (cmd_settings, (0,)),
+        "status": (cmd_status, (0,)), "rcon": (cmd_rcon, tuple(range(1, 10))), "settings": (cmd_settings, (0, 1)),
         "set-settings": (cmd_set_settings, (1,)), "bans": (cmd_bans, (0,)), "unban": (cmd_unban, (1,)),
         "restart": (cmd_restart, (0,)), "backups": (cmd_backups, (0,)), "restore": (cmd_restore, (1,)),
         "prune-backups": (cmd_prune_backups, (1,)),
