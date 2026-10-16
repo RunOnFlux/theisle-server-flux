@@ -112,6 +112,11 @@ Bans are in hours: 0 expires at once, so there is no permanent ban; use a large 
 
 ## Versions
 
+- **1.0.4** (2026-10-16): the image applies Ubuntu's pending updates when it is built (`apt-get
+  upgrade`), so a rebuild clears what the published image was missing; the base is pinned to the
+  digest the build resolved and recorded in `org.opencontainers.image.base.digest`. The scheduled
+  CI run publishes only when something is waiting (an urgent security update now, anything else
+  on the first Monday of the month), since every new `:latest` restarts every server.
 - **1.0.3** (2026-10-16): EnabledMutations written as the struct the game reads,
   `(MutationName="Hemomania",EffectValue=0.05)`; the "Hemomania, 0.05" form 1.0.2 wrote is refused
   by the engine ("ImportText (EnabledMutations): Missing opening parenthesis", measured on build

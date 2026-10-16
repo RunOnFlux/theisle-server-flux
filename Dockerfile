@@ -16,6 +16,7 @@ ARG FLUX_IMAGE_VERSION=dev
 
 # python3, NOT python3-minimal: fluxisle.py needs json and socket. util-linux brings setpriv.
 RUN apt-get update -y && \
+    apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends ca-certificates curl procps tzdata python3 util-linux && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
