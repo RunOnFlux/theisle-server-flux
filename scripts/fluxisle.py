@@ -16,6 +16,10 @@
     flux-isle backups                  the backups in flux/backups (name, size, date, why)
     flux-isle restore <backup>         stop, keep a safety backup, put that backup in place, start
     fluxisle.py migrate-legacy         move a server from the previous image's layout (the entrypoint)
+    flux-isle islepilot                IslePilot: on or off, loaded, connected, its key and its log
+    flux-isle islepilot on|off         turn the IslePilot plugin on or off (applies on the next start)
+    flux-isle islepilot reset-key      a new IslePilot key on the next start (unpairs the server)
+    fluxisle.py islepilot-enabled      exit 0 when IslePilot is on (the entrypoint)
 
 THE RCON IS NEVER PUBLISHED. The Isle's RCON authorises an IP address once a password was right,
 not a connection: anyone behind the same address gets in afterwards with no password (measured).
@@ -55,6 +59,16 @@ RCON_SECRET = os.path.join(STATE_DIR, "rcon.secret")
 SAVED_DIR = os.path.join(DATA_DIR, "Saved")
 GAME_INI = os.path.join(SAVED_DIR, "Config", "LinuxServer", "Game.ini")
 BANS_FILE = os.path.join(SAVED_DIR, "PlayerData", "PlayerBans.json")
+# IslePilot (islepilot.eu), a third party's plugin preloaded into the game when the owner turns it
+# on. It keeps its key, config and log next to the library it was loaded from, so the entrypoint
+# preloads it through a link in ISLEPILOT_DIR (synced: the key survives a move to another node)
+# to the copy it downloads into the install (local: 11 MB that need no syncing).
+ISLEPILOT_DIR = os.path.join(STATE_DIR, "islepilot")
+ISLEPILOT_SWITCH = os.path.join(STATE_DIR, "islepilot.json")
+ISLEPILOT_DOWNLOAD = os.path.join(STATE_DIR, "islepilot-download.json")
+ISLEPILOT_CONFIG = os.path.join(ISLEPILOT_DIR, "islepilot-config.json")
+ISLEPILOT_LOG = os.path.join(ISLEPILOT_DIR, "islepilot-plugin.log")
+ISLEPILOT_LIB = "libisleplugin.so"
 RCON_HOST = "127.0.0.1"
 RCON_PORT = int(os.environ.get("FLUX_RCON_PORT", "8888"))
 
@@ -657,6 +671,7 @@ def cmd_status():
         "name": values["serverName"], "players": players, "max_players": values["maxPlayers"],
         "queue": queue, "rcon": rcon_ok, "pending": changes_pending(state),
         "legacyData": legacy_present(), "migrated": read_json(MIGRATION_FILE),
+        "islepilot": {"enabled": islepilot_enabled(), "loaded": islepilot_loaded()},
     })
 
 
@@ -758,6 +773,112 @@ def cmd_restart():
         except OSError:
             pass
     out({"ok": True})
+
+
+# ------------------------------------------------------------------------------------------------
+# IslePilot: a third party's plugin, off unless the owner turns it on
+# ------------------------------------------------------------------------------------------------
+#
+# The plugin (Folgmann Studios, islepilot.eu) runs INSIDE the game process: it is preloaded into
+# the server binary only (LD_PRELOAD on the game's exec, never on anything else: its constructor
+# starts a thread in any process that loads it). It prints a key (ipk_ + 32 hex) on its first
+# start and writes it to islepilot-config.json; the owner pastes the key on islepilot.eu to pair,
+# and from then on the plugin talks to IslePilot over a WebSocket. Until the key is paired every
+# connection is refused ("Invalid key", measured), which the plugin logs as a failed handshake.
+
+KEY_RE = re.compile(r"ipk_[0-9a-f]{32}")
+
+
+def islepilot_enabled():
+    data = read_json(ISLEPILOT_SWITCH, {}) or {}
+    return data.get("enabled") is True
+
+
+def game_pids():
+    return subprocess.run(["pgrep", "-f", r"TheIsleServer-Linux-Shipping TheIsle "], capture_output=True, text=True).stdout.split()
+
+
+def islepilot_loaded():
+    """True when the running server has the plugin mapped, None when no server runs."""
+    pids = game_pids()
+    if not pids:
+        return None
+    # Read as the server's own user: root in the container has no CAP_SYS_PTRACE, which reading
+    # another user's maps takes.
+    uid = os.environ.get("FLUX_UID", "1000")
+    try:
+        maps = subprocess.run(["setpriv", f"--reuid={uid}", f"--regid={uid}", "--clear-groups", "cat", f"/proc/{pids[0]}/maps"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return ISLEPILOT_LIB in maps.stdout if maps.returncode == 0 else None
+
+
+def islepilot_log_facts(lines):
+    """What the plugin's own log says: its build, and whether its last WebSocket attempt connected."""
+    build, connection, anticrash = None, None, 0
+    for line in lines:
+        m = re.search(r"\[build\] plugin build (\S+)", line)
+        if m:
+            build = m.group(1)
+            connection = None
+        if "[ws] connected to " in line:
+            connection = "connected"
+        elif "[ws] connect failed" in line:
+            connection = "refused"
+        if "ANTI-CRASH" in line:
+            anticrash += 1
+    return {"pluginBuild": build, "connection": connection, "anticrashRestarts": anticrash}
+
+
+def islepilot_log_tail(count=60):
+    try:
+        with open(ISLEPILOT_LOG, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+    # From the newest start on: an older start's lines say nothing about this one.
+    starts = [i for i, line in enumerate(lines) if "IslePilot plugin attached" in line]
+    if starts:
+        lines = lines[starts[-1]:]
+    return lines[-count:] if count else lines
+
+
+def cmd_islepilot(action=None):
+    if action in ("on", "off"):
+        write_json(ISLEPILOT_SWITCH, {"enabled": action == "on", "changed": int(time.time())})
+        out({"ok": True, "enabled": action == "on", "appliesOn": "restart"})
+        return
+    if action == "reset-key":
+        try:
+            os.remove(ISLEPILOT_CONFIG)
+        except FileNotFoundError:
+            pass
+        out({"ok": True, "appliesOn": "restart"})
+        return
+    if action is not None:
+        fail("expected on, off or reset-key", 2)
+    lines = islepilot_log_tail(0)
+    facts = islepilot_log_facts(lines)
+    config = read_json(ISLEPILOT_CONFIG, {}) or {}
+    key = config.get("apiKey") if isinstance(config.get("apiKey"), str) and KEY_RE.fullmatch(config.get("apiKey")) else None
+    enabled, loaded = islepilot_enabled(), islepilot_loaded()
+    if not enabled:
+        stage = "restart" if loaded else "off"
+    elif loaded is None:
+        stage = "stopped"
+    elif not loaded:
+        stage = "restart" if read_json(ISLEPILOT_DOWNLOAD, {}).get("ok") is not False else "unavailable"
+    elif facts["connection"] == "connected":
+        stage = "connected"
+    else:
+        stage = "unpaired" if key else "starting"
+    out({
+        "enabled": enabled, "loaded": loaded, "stage": stage, "apiKey": key,
+        "download": read_json(ISLEPILOT_DOWNLOAD), **facts,
+        # The key is shown above on purpose (the owner pastes it); never in the log lines.
+        "log": [KEY_RE.sub("ipk_" + "•" * 8, line) for line in lines[-60:]],
+    })
 
 
 # ------------------------------------------------------------------------------------------------
@@ -972,6 +1093,8 @@ def main(argv):
         "restart": (cmd_restart, (0,)), "backups": (cmd_backups, (0,)), "restore": (cmd_restore, (1,)),
         "prune-backups": (cmd_prune_backups, (1,)),
         "migrate-legacy": (cmd_migrate_legacy, (0,)),
+        "islepilot": (cmd_islepilot, (0, 1)),
+        "islepilot-enabled": (lambda: sys.exit(0 if islepilot_enabled() else 1), (0,)),
     }
     if not argv or argv[0] not in commands or len(argv) - 1 not in commands[argv[0]][1]:
         print(__doc__, file=sys.stderr)

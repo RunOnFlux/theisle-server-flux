@@ -194,5 +194,43 @@ check "settings leave the password out" "" "$(isle settings | python3 -c 'import
 check "but say one is set" "True" "$(isle settings | python3 -c 'import json,sys;print(json.load(sys.stdin)["passwordSet"])')"
 check "settings password includes it" "pw9" "$(isle settings password | python3 -c 'import json,sys;print(json.load(sys.stdin)["values"]["password"])')"
 
+# IslePilot: off by default, a switch the panel flips, and its own log read for the panel.
+ipj() { isle islepilot | python3 -c "import json,sys;d=json.load(sys.stdin);print($1)"; }
+check "IslePilot is off by default" "1" "$(status isle islepilot-enabled)"
+check "off: stage off, no key" "off None" "$(ipj 'd["stage"], d["apiKey"]')"
+check "turned on" "True restart" "$(isle islepilot on | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["enabled"], d["appliesOn"])')"
+check "and the entrypoint sees it" "0" "$(status isle islepilot-enabled)"
+check "status says so" "True" "$(isle status | python3 -c 'import json,sys;print(json.load(sys.stdin)["islepilot"]["enabled"])')"
+check "no server running: stopped" "stopped" "$(ipj 'd["stage"]')"
+check "a bad action is refused" "2" "$(status isle islepilot sideways)"
+mkdir -p "${data}/flux/islepilot"
+key="ipk_0123456789abcdef0123456789abcdef"
+printf '{\n  "apiKey": "%s",\n  "backendUrl": "https://islepilot.eu"\n}\n' "${key}" >"${data}/flux/islepilot/islepilot-config.json"
+printf '%s\n' "[1] IslePilot plugin attached (linux .so)" "[1] [build] plugin build old" "[1] [ws] connected to https://islepilot.eu/ws" \
+  "[2] IslePilot plugin attached (linux .so)" "[2] [build] plugin build 4bc2a86c" "[2]   ${key}" "[2] [ws] connect failed: ws handshake (no/bad response)" \
+  >"${data}/flux/islepilot/islepilot-plugin.log"
+check "the key, the newest start's build and connection" "${key} 4bc2a86c refused" "$(ipj 'd["apiKey"], d["pluginBuild"], d["connection"]')"
+check "the log starts at the newest start" "4" "$(ipj 'len(d["log"])')"
+check "and never shows the key" "0" "$(ipj 'sum("'"${key}"'" in l for l in d["log"])')"
+check "a malformed key is not passed on" "None" "$(printf '{"apiKey": "ipk_x; rm -rf /"}' >"${data}/flux/islepilot/islepilot-config.json"; ipj 'd["apiKey"]')"
+check "reset-key removes the config" "1" "$(isle islepilot reset-key >/dev/null; status test -f "${data}/flux/islepilot/islepilot-config.json")"
+check "turned off" "1" "$(isle islepilot off >/dev/null; status isle islepilot-enabled)"
+
+check "IslePilot's panel restart is requested, not a crash" "requested: from IslePilot (panel)" \
+  "$(printf '%s\n' '[shutdown] graceful stop requested by panel' '[shutdown] saved 3 players' | flux_islepilot_reason 0)"
+check "our own SIGTERM is not IslePilot's" "" "$(printf '%s\n' '[shutdown] graceful stop requested by launcher/signal' | flux_islepilot_reason 0)"
+check "its anti-crash counts as a crash" "IslePilot restarted the server after a crash it caught (exit 90)" \
+  "$(printf '%s\n' '[IslePilot] ANTI-CRASH: fault -> heap likely corrupt, clean restart (exit 90)' | flux_islepilot_reason 90)"
+check "exit 90 alone too" "IslePilot restarted the server after a crash it caught (exit 90)" "$(printf '' | flux_islepilot_reason 90)"
+check "a plain crash is left to the caller" "" "$(printf '%s\n' '[heartbeat] sent=1' | flux_islepilot_reason 139)"
+check "the anti-crash wins over our SIGTERM" "IslePilot restarted the server after a crash it caught (exit 90)" \
+  "$(printf '%s\n' '[shutdown] graceful stop requested by launcher/signal' '[IslePilot] ANTI-CRASH: x' | flux_islepilot_reason 90)"
+printf 'plugin' >"${tmp}/lib.so"
+sha256sum "${tmp}/lib.so" >"${tmp}/lib.so.sha256"
+check "a matching checksum" "0" "$(status flux_sha256_matches "${tmp}/lib.so.sha256" "${tmp}/lib.so")"
+check "a bare hash too" "0" "$(sha256sum "${tmp}/lib.so" | cut -d' ' -f1 >"${tmp}/bare"; status flux_sha256_matches "${tmp}/bare" "${tmp}/lib.so")"
+check "a different file" "1" "$(printf 'other' >"${tmp}/other.so"; status flux_sha256_matches "${tmp}/lib.so.sha256" "${tmp}/other.so")"
+check "an HTML error page is no checksum" "1" "$(printf '<html>' >"${tmp}/bad"; status flux_sha256_matches "${tmp}/bad" "${tmp}/lib.so")"
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" = "0" ]

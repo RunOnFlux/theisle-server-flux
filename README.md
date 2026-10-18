@@ -20,6 +20,8 @@ supervisor that:
 - restores a backup on request (`flux-isle restore`): a safety backup of the current state first
 - moves a server from the previous image (ghcr.io/auhrus/theisleevrima) on its first start
 - gives the hub JSON status and RCON commands (`flux-isle`)
+- loads **IslePilot** (islepilot.eu, a third party's admin panel and plugin) into the server when the
+  owner turns it on in the hub; off by default (see below)
 
 ## Why the RCON is never published
 
@@ -79,6 +81,33 @@ The panel has every other setting: see `SETTINGS` in `scripts/fluxisle.py`.
 | `flux-isle bans` / `unban <steamid>` | `PlayerBans.json`; an unban is applied on the next start (the server owns the file) |
 | `flux-isle restart` | save, stop and start again |
 | `flux-isle backups` / `restore <name>` | the backups; a restore stops the server, keeps a `-pre-restore` backup of the current state, puts the archive in place and starts |
+| `flux-isle islepilot` / `islepilot on\|off\|reset-key` | IslePilot's switch, whether the running server has it loaded, its key, build, last connection and the newest start of its log (key masked); on, off and a new key apply on the next start |
+
+## IslePilot
+
+[IslePilot](https://islepilot.eu) (Folgmann Studios) is a web panel, player website and Discord bot
+for The Isle, driven by a plugin that runs INSIDE the game process. Off unless the owner turns it
+on (`flux-isle islepilot on`, the hub's IslePilot tab). Then, on every start:
+
+1. the newest Linux plugin is downloaded from `ISLEPILOT_URL`
+   (`https://islepilot.eu/cdn/plugin/libisleplugin.so`, the URL IslePilot's own self-hosted panel
+   uses) into the install, `/mnt/isle/server/islepilot/`, and checked against the `.sha256` beside
+   it; IslePilot rebuilds it for every Evrima build, so it is fetched every time. A failed
+   download or a wrong checksum starts the copy already on the node, or none
+   (`flux/islepilot-download.json` says which)
+2. `flux/islepilot/libisleplugin.so` on the data volume links to it, and the game is started with
+   `LD_PRELOAD` on that link, by `env` on the game's exec only: the plugin's constructor starts a
+   thread in any process that loads it. It keeps its key (`islepilot-config.json`) and log beside
+   the path it was loaded from, so they are synced and the key survives a move to another node
+3. the plugin prints a key (`ipk_` + 32 hex); the owner pastes it on islepilot.eu ("Add server") to
+   pair. Until then IslePilot refuses its WebSocket ("Invalid key", measured)
+
+It ends the server itself in two ways, told apart by its log: a stop asked from its panel is
+"requested: from IslePilot (...)" and restarts in place uncounted; its anti-crash's exit 90 counts
+towards the restart budget like any crash. It saves the players on our SIGTERM before handing it on
+(the server then exits 143). Measured on build 24664709 with plugin build 4bc2a86c: loaded, hooks
+resolved, key printed, the server up in the usual time. Pairing and IslePilot's features were not
+tested here.
 
 ## Moving from the previous image
 
@@ -112,6 +141,10 @@ Bans are in hours: 0 expires at once, so there is no permanent ban; use a large 
 
 ## Versions
 
+- **1.1.0** (2026-10-18): IslePilot, off by default: `flux-isle islepilot on|off|reset-key`,
+  the plugin downloaded and checksummed on every start, preloaded into the game only, its key
+  kept on the synced volume; IslePilot's own restarts told apart from crashes; `status` has
+  `islepilot` (`enabled`, `loaded`).
 - **1.0.4** (2026-10-16): the image applies Ubuntu's pending updates when it is built (`apt-get
   upgrade`), so a rebuild clears what the published image was missing; the base is pinned to the
   digest the build resolved and recorded in `org.opencontainers.image.base.digest`. The scheduled

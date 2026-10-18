@@ -161,3 +161,34 @@ flux_public_build() {
 flux_game_pid() {
   pgrep -f 'TheIsleServer-Linux-Shipping TheIsle ' 2>/dev/null | head -1
 }
+
+# ---------------------------------------------------------------------------------------------
+# IslePilot (islepilot.eu): a third party's plugin inside the game process, when the owner turns
+# it on. It can end the server itself: a graceful stop asked from its panel (a restart or a
+# schedule there), or exit 90 when its anti-crash decides the heap is corrupt. Both are told
+# apart from a plain crash by its own log.
+# ---------------------------------------------------------------------------------------------
+
+# $1 = the server's exit code; stdin = IslePilot's log lines from this generation. Prints why the
+# server ended when IslePilot ended it, nothing otherwise. A stop IslePilot was asked for from its
+# panel is "requested:" (not a crash); its anti-crash exit is not, so a loop of them still ends the
+# container. "launcher/signal" is the plugin seeing our own SIGTERM.
+flux_islepilot_reason() {
+  awk -v rc="$1" '
+    /ANTI-CRASH/ { crash = 1 }
+    /\[shutdown\] graceful stop requested by / { by = $0; sub(/.*graceful stop requested by /, "", by) }
+    END {
+      if (by != "" && by !~ /^launcher\/signal/) { print "requested: from IslePilot (" by ")"; exit }
+      if (crash || rc == 90) print "IslePilot restarted the server after a crash it caught (exit " rc ")"
+    }'
+}
+
+# $1 = a file holding "<sha256>  <name>" or just "<sha256>", $2 = the file it describes. True when
+# they match.
+flux_sha256_matches() {
+  local want got
+  want="$(awk 'NR == 1 { print tolower($1) }' "$1" 2>/dev/null)"
+  [[ "${want}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  got="$(sha256sum "$2" 2>/dev/null | awk '{ print $1 }')"
+  [ "${want}" = "${got}" ]
+}

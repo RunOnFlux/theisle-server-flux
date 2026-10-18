@@ -34,3 +34,6 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 - **Bans are in hours; 0 expires at once.** `PlayerBans.json` is the server's while it runs:
   unbans are applied before the next start.
 - **Readiness = the RCON answering**, not a log line.
+- **IslePilot is preloaded into the game's exec only** (`env LD_PRELOAD=...`): its constructor
+  starts a thread in anything that loads it. Root here cannot read uid 1000's `/proc/<pid>/maps`
+  (no CAP_SYS_PTRACE): read it through `setpriv` as the server user.

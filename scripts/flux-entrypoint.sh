@@ -40,6 +40,10 @@ FLUX_RESTORE_MARKER="${FLUX_RESTORE_MARKER:-/tmp/flux-restore-requested}"
 FLUX_UPDATE_FAILED="${FLUX_STATE_DIR}/update-failed"
 FLUX_UPDATE_CHECK_MINUTES="${FLUX_UPDATE_CHECK_MINUTES:-30}"
 FLUX_WARN_MINUTES="${FLUX_WARN_MINUTES:-5}"
+# IslePilot's Linux plugin, the URL its own self-hosted panel downloads it from (PLUGIN_SO_URL),
+# with a .sha256 beside it. Rebuilt by IslePilot for every Evrima build, so fetched on every start.
+ISLEPILOT_URL="${ISLEPILOT_URL:-https://islepilot.eu/cdn/plugin/libisleplugin.so}"
+ISLEPILOT_LOG_MAX_LINES="${ISLEPILOT_LOG_MAX_LINES:-5000}"
 # Epic Online Services' dedicated-server client for The Isle: the pair every host and template
 # uses (CubeCoders AMP, the Pterodactyl egg). Overridable, should Afterthought ever rotate it.
 ISLE_EOS_CLIENT_ID="${ISLE_EOS_CLIENT_ID:-xyza7891gk5PRo3J7G9puCJGFJjmEguW}"
@@ -69,6 +73,8 @@ fi
 flux_log "flux-entrypoint starting (image ${FLUX_IMAGE_VERSION:-dev}): game ${port}/udp, queue ${queue_port}/tcp, RCON on 127.0.0.1 only, daily restart ${restart_at:-off}"
 
 game_pid=""
+islepilot_so=""
+islepilot_from=0
 watch_pid=""
 backup_pid=""
 terminating=0
@@ -155,6 +161,49 @@ prepare_user() {
   cp -f /root/.local/share/Steam/steamcmd/linux64/steamclient.so "${home}/.steam/sdk64/" 2>/dev/null
   chown -R "${FLUX_UID}:${FLUX_UID}" "${home}/.steam" "${d}/Saved"
   chown "${FLUX_UID}:${FLUX_UID}" "${s}/TheIsle" 2>/dev/null
+}
+
+# IslePilot, when the owner turned it on in the panel (flux-isle islepilot on): the newest plugin
+# downloaded into the install and checked against its .sha256, then linked from flux/islepilot on
+# the data volume. The plugin keeps its key, config and log beside the path it was loaded from,
+# so they are synced and the key survives a move to another node. A failed download starts the
+# copy already here; with none, the server starts without it. Sets islepilot_so.
+islepilot_prepare() {
+  local dir="${d}/flux/islepilot" local_dir="${s}/islepilot" lib="libisleplugin.so" error="" f
+  islepilot_so=""
+  islepilot_from=0
+  if ! isle islepilot-enabled; then
+    rm -f "${dir}/${lib}"
+    return 0
+  fi
+  mkdir -p "${dir}" "${local_dir}"
+  rm -f "${local_dir}/.download" "${local_dir}/.download.sha256"
+  if ! curl -fsSL --max-time 180 -o "${local_dir}/.download" "${ISLEPILOT_URL}"; then
+    error="the plugin could not be downloaded from IslePilot"
+  elif ! curl -fsSL --max-time 30 -o "${local_dir}/.download.sha256" "${ISLEPILOT_URL}.sha256"; then
+    error="IslePilot's checksum could not be downloaded"
+  elif ! flux_sha256_matches "${local_dir}/.download.sha256" "${local_dir}/.download"; then
+    error="the download did not match IslePilot's checksum"
+  else
+    mv -f "${local_dir}/.download" "${local_dir}/${lib}"
+  fi
+  rm -f "${local_dir}/.download" "${local_dir}/.download.sha256"
+  if [ -n "${error}" ]; then
+    flux_log "WARN IslePilot: ${error}$([ -f "${local_dir}/${lib}" ] && echo "; starting the copy already on this node")"
+    printf '{"ok": false, "at": %s, "error": "%s", "fallback": %s}\n' "$(date +%s)" "${error}" "$([ -f "${local_dir}/${lib}" ] && echo true || echo false)" >"${d}/flux/islepilot-download.json"
+    [ -f "${local_dir}/${lib}" ] || { rm -f "${dir}/${lib}"; return 0; }
+  else
+    printf '{"ok": true, "at": %s, "sha256": "%s"}\n' "$(date +%s)" "$(sha256sum "${local_dir}/${lib}" | cut -d' ' -f1)" >"${d}/flux/islepilot-download.json"
+  fi
+  chmod 0644 "${local_dir}/${lib}"
+  ln -sfn "${local_dir}/${lib}" "${dir}/${lib}"
+  for f in "${dir}"/*.log "${dir}"/*.jsonl; do
+    [ -f "${f}" ] && flux_trim_file "${f}" "${ISLEPILOT_LOG_MAX_LINES}"
+  done
+  chown -R -h "${FLUX_UID}:${FLUX_UID}" "${dir}"
+  [ -f "${dir}/islepilot-plugin.log" ] && islepilot_from="$(wc -l <"${dir}/islepilot-plugin.log")"
+  islepilot_so="${dir}/${lib}"
+  flux_log "IslePilot: plugin $(sha256sum "${local_dir}/${lib}" | cut -c1-12) loaded into the server (a third party's; turned on in the panel)"
 }
 
 # Minutes since the newest backup was written; empty when there is none.
@@ -318,14 +367,19 @@ start_generation() {
     flux_log "config: ${line#\# }"
   done < <(isle apply 2>&1)
   prepare_user
+  islepilot_prepare
   [ "${terminating}" = "1" ] && return 2
 
   isle state starting "Loading Gateway"
   flux_log "starting the server (generation ${generation})"
+  local preload=()
+  [ -n "${islepilot_so}" ] && preload=("LD_PRELOAD=${islepilot_so}")
   (
     cd "${s}" || exit 1
     # -log: the engine log to stdout (the container's output) and Saved/Logs/TheIsle.log.
-    exec setpriv --reuid="${FLUX_UID}" --regid="${FLUX_UID}" --init-groups env HOME="$(getent passwd "${FLUX_UID}" | cut -d: -f6)" \
+    # IslePilot's plugin is preloaded by `env` into the game only: setpriv and env are already
+    # running when it is set, and its constructor starts a thread in whatever loads it.
+    exec setpriv --reuid="${FLUX_UID}" --regid="${FLUX_UID}" --init-groups env HOME="$(getent passwd "${FLUX_UID}" | cut -d: -f6)" "${preload[@]}" \
       "./${FLUX_GAME_BINARY}" TheIsle -Port="${port}" -log \
       "-ini:Engine:[EpicOnlineServices]:DedicatedServerClientId=${ISLE_EOS_CLIENT_ID}" \
       "-ini:Engine:[EpicOnlineServices]:DedicatedServerClientSecret=${ISLE_EOS_CLIENT_SECRET}"
@@ -397,6 +451,9 @@ while true; do
     flux_log "stopped on request (server exited ${rc})"
     isle state stopped
     exit 0
+  fi
+  if [ -z "${reason}" ] && [ -n "${islepilot_so}" ]; then
+    reason="$(tail -n +"$((islepilot_from + 1))" "${d}/flux/islepilot/islepilot-plugin.log" 2>/dev/null | flux_islepilot_reason "${rc}")"
   fi
   [ -z "${reason}" ] && reason="the server ended on its own (exit ${rc})"
   last_reason="${reason}"

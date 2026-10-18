@@ -113,6 +113,42 @@ check "a restore puts the backup in place" "0" "$(status wait_for '[ "$(wc -l <$
 check "after a safety backup of what was there" "0" "$(status bash -c "ls ${data}/flux/backups/*-theisle-pre-restore.tar.gz")"
 check "the restore was not counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
 
+# IslePilot: a stand-in plugin (any real library loads into the stand-in server) served from a
+# file:// URL with its .sha256, switched on from the panel, preloaded into the game only.
+mkdir -p /tmp/ip
+cp "$(python3 -c 'import zlib,re;print(re.search(r"\S*libz\.so\S*",open("/proc/self/maps").read()).group(0))')" /tmp/ip/libisleplugin.so
+sha256sum /tmp/ip/libisleplugin.so | cut -d' ' -f1 >/tmp/ip/libisleplugin.so.sha256
+export ISLEPILOT_URL=file:///tmp/ip/libisleplugin.so
+kill -TERM "${entry}"; wait_for '! kill -0 ${entry} 2>/dev/null' 20
+flux-isle islepilot on >/dev/null
+/opt/flux/flux-entrypoint.sh >/tmp/entry.log 2>&1 &
+entry=$!
+game_maps() { setpriv --reuid=1000 --regid=1000 --clear-groups cat "/proc/$(pgrep -f 'TheIsleServer-Linux-Shipping TheIsle ')/maps" 2>/dev/null; }
+check "IslePilot on: the server comes up" "0" "$(status wait_for 'grep -q "\"running\"" ${data}/flux/state.json 2>/dev/null' 40)"
+check "with the plugin preloaded" "1" "$(game_maps | grep -c -m1 'islepilot/libisleplugin.so')"
+check "into the game only, not the supervisor" "0" "$(grep -c libisleplugin /proc/${entry}/maps)"
+check "the link on the data volume points into the install" "/mnt/isle/server/islepilot/libisleplugin.so" "$(readlink "${data}/flux/islepilot/libisleplugin.so")"
+check "the plugin's folder is the server user's" "1000" "$(stat -c %u "${data}/flux/islepilot")"
+check "flux-isle sees it loaded" "True True" "$(flux-isle islepilot | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["loaded"], d["download"]["ok"])')"
+check "status too" "True" "$(flux-isle status | python3 -c 'import json,sys;print(json.load(sys.stdin)["islepilot"]["loaded"])')"
+check "said in the log" "0" "$(status grep -q 'IslePilot: plugin .* loaded into the server' /tmp/entry.log)"
+
+# A checksum that does not match: the copy already on the node is used, and the panel is told.
+echo 0000000000000000000000000000000000000000000000000000000000000000 >/tmp/ip/libisleplugin.so.sha256
+flux-isle restart >/dev/null
+check "a bad checksum keeps the copy already here" "0" "$(status wait_for 'grep -q "did not match IslePilot.s checksum; starting the copy" /tmp/entry.log && grep -q "\"running\"" ${data}/flux/state.json' 40)"
+check "still loaded, the panel told" "True False True" "$(flux-isle islepilot | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["loaded"], d["download"]["ok"], d["download"]["fallback"])')"
+
+# Off: the next start loads nothing.
+flux-isle islepilot off >/dev/null
+check "turned off: restart needed" "restart" "$(flux-isle islepilot | python3 -c 'import json,sys;print(json.load(sys.stdin)["stage"])')"
+flux-isle restart >/dev/null
+sleep 2
+check "off: the server comes back" "0" "$(status wait_for 'grep -q "\"running\"" ${data}/flux/state.json && [ -n "$(pgrep -f "TheIsleServer-Linux-Shipping TheIsle ")" ]' 40)"
+check "without the plugin" "0" "$(game_maps | grep -c libisleplugin)"
+check "and the link is gone" "1" "$(status test -L "${data}/flux/islepilot/libisleplugin.so")"
+check "IslePilot never counted as a crash" "0" "$(grep -c 'restarts within' /tmp/entry.log)"
+
 kill -TERM "${entry}"
 check "a stop ends the supervisor" "0" "$(status wait_for '! kill -0 ${entry} 2>/dev/null' 20)"
 check "and says stopped" "stopped" "$(python3 -c 'import json;print(json.load(open("'"${data}"'/flux/state.json"))["state"])')"
