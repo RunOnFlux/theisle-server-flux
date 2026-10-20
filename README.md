@@ -35,8 +35,8 @@ prints the join password in plain text, so it is not one of the commands `flux-i
 
 | Path | Flux mount | What |
 |---|---|---|
-| `/mnt/isle/data` | `g:` (synced) | `Saved/` (the install's `TheIsle/Saved` links here: `PlayerData/` with the encrypted player database and `PlayerBans.json`, `Config/LinuxServer/Game.ini`, logs) and `flux/` (log, state, settings, the RCON password, backups) |
-| `/mnt/isle/server` | `ml:server` (local) | the game, ~1.5 GB. Downloaded again on a new node |
+| `/mnt/isle/data` | `g:` (synced) | `Saved/` (the install's `TheIsle/Saved` links here: `PlayerData/` with the encrypted player database and `PlayerBans.json`, `Config/LinuxServer/Game.ini`, logs) and `flux/` (state, settings, the RCON password, backups) |
+| `/mnt/isle/server` | `ml:server` (local) | the game, ~1.5 GB, and our `flux-logs/flux.log` (5 MB, one `.1`). Downloaded again on a new node |
 
 Spec: `g:/mnt/isle/data|ml:server:/mnt/isle/server`.
 
@@ -141,6 +141,7 @@ Bans are in hours: 0 expires at once, so there is no permanent ban; use a large 
 
 ## Versions
 
+- **1.1.1** (2026-10-20): flux.log moved off the synced data volume to `flux-logs/flux.log` on the local install volume (5 MB, one `.1` rotated copy; an old one on the data volume is appended there once and deleted); the FluxCloud start-up banner at container start and on every server generation; the scheduled build runs on Mondays and publishes only for an urgent security update or commits the published image does not have.
 - **1.1.0** (2026-10-18): IslePilot, off by default: `flux-isle islepilot on|off|reset-key`,
   the plugin downloaded and checksummed on every start, preloaded into the game only, its key
   kept on the synced volume; IslePilot's own restarts told apart from crashes; `status` has

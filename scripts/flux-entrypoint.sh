@@ -54,7 +54,10 @@ d="${FLUX_DATA_DIR}"
 isle() { python3 /opt/flux/fluxisle.py "$@"; }
 
 rm -f "${FLUX_RESTART_MARKER}"
-mkdir -p "${s}" "${d}/Saved" "${FLUX_STATE_DIR}"
+mkdir -p "${s}" "${d}/Saved" "${FLUX_STATE_DIR}" "$(dirname "${FLUX_LOG}")"
+# An older image kept flux.log on the synced data volume: move it here, once.
+flux_log_migrate "${FLUX_STATE_DIR}/flux.log"
+flux_banner "The Isle"
 
 if ! port="$(flux_valid_port "${ISLE_PORT:-}" 7777)"; then
   flux_log "ERROR ISLE_PORT='${ISLE_PORT:-}' is not a port; refusing to start"
@@ -371,6 +374,7 @@ start_generation() {
   [ "${terminating}" = "1" ] && return 2
 
   isle state starting "Loading Gateway"
+  flux_banner "The Isle"
   flux_log "starting the server (generation ${generation})"
   local preload=()
   [ -n "${islepilot_so}" ] && preload=("LD_PRELOAD=${islepilot_so}")

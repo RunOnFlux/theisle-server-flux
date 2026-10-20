@@ -37,3 +37,4 @@ A change to what the image does bumps `VERSION` and gets a line under "Versions"
 - **IslePilot is preloaded into the game's exec only** (`env LD_PRELOAD=...`): its constructor
   starts a thread in anything that loads it. Root here cannot read uid 1000's `/proc/<pid>/maps`
   (no CAP_SYS_PTRACE): read it through `setpriv` as the server user.
+- **flux.log is local** (`${FLUX_SERVER_DIR}/flux-logs/flux.log`, 5 MB + one `.1`, on the `ml:` mount), never the synced data volume. `flux_log_migrate` moves an older `flux/flux.log` there once. `entrypoint` creates the dir explicitly. The start-up banner is `flux_banner "<game>"` (container start and every generation); keep its text.
