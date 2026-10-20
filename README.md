@@ -47,8 +47,9 @@ Spec: `g:/mnt/isle/data|ml:server:/mnt/isle/server`.
 | `ISLE_PORT` | 7777/udp | the game |
 | `ISLE_QUEUE_PORT` | 10000/tcp | the join queue (players wait for a slot on a full server) |
 
-No Steam query port: the server lists itself through Epic Online Services. RCON 8888/tcp stays
-inside.
+No Steam query port: the server lists itself through Epic Online Services, at the port Game.ini's
+`QueryPort` names (not `-Port`), so the image writes `QueryPort` = `ISLE_PORT` on every start.
+RCON 8888/tcp stays inside.
 
 ## Environment
 
@@ -141,6 +142,9 @@ Bans are in hours: 0 expires at once, so there is no permanent ban; use a large 
 
 ## Versions
 
+- **1.1.2** (2026-10-20): `QueryPort` written to Game.ini as the game port. It is the port the
+  server registers with Epic Online Services, so the in-game server list sent every player of a
+  server on a port other than 7777 to 7777, and the join timed out.
 - **1.1.1** (2026-10-20): flux.log moved off the synced data volume to `flux-logs/flux.log` on the local install volume (5 MB, one `.1` rotated copy; an old one on the data volume is appended there once and deleted); the FluxCloud start-up banner at container start and on every server generation; the scheduled build runs on Mondays and publishes only for an urgent security update or commits the published image does not have.
 - **1.1.0** (2026-10-18): IslePilot, off by default: `flux-isle islepilot on|off|reset-key`,
   the plugin downloaded and checksummed on every start, preloaded into the game only, its key

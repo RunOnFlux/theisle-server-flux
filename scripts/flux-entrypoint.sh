@@ -64,6 +64,8 @@ if ! port="$(flux_valid_port "${ISLE_PORT:-}" 7777)"; then
   isle state crashed "ISLE_PORT is not a usable port"
   exit 42
 fi
+# apply writes it to Game.ini as QueryPort: the port the server tells Epic, not -Port.
+export ISLE_PORT="${port}"
 if ! queue_port="$(flux_valid_port "${ISLE_QUEUE_PORT:-}" 10000)"; then
   flux_log "ERROR ISLE_QUEUE_PORT='${ISLE_QUEUE_PORT:-}' is not a port; refusing to start"
   exit 42

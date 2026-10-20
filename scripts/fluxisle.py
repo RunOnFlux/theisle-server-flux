@@ -351,17 +351,21 @@ def parse_ini(text):
     return sections
 
 
-def render_game_ini(existing, values, rcon_password, rcon_port, queue_port):
+def render_game_ini(existing, values, rcon_password, rcon_port, queue_port, game_port=7777):
     """Game.ini with OUR keys written and everything else the file had kept. The server rewrites
     this file itself (it adds ;METADATA, drops quotes, writes values RCON changed): what it wrote
-    stays unless it is a key we own, which is written from the settings on every start."""
+    stays unless it is a key we own, which is written from the settings on every start.
+
+    QueryPort is the port the server registers with Epic Online Services (ADDRESSBOUND_s), and the
+    in-game list sends players there. It does NOT follow -Port: without it the list said 7777 on a
+    server bound to another port and every join timed out (measured on 0.21.784)."""
     owned = {}
     for name, (section, key, kind, _) in SETTINGS.items():
         owned.setdefault(section, {})[key] = (kind, values[name])
     extra = {ENGINE_SESSION: {"MaxPlayers": ("int", values["maxPlayers"])}, SESSION: {
         "MapName": ("text", "Gateway"), "bServerPassword": ("bool", bool(values["password"])),
         "bRconEnabled": ("bool", True), "RconPassword": ("text", rcon_password), "RconPort": ("int", rcon_port),
-        "QueuePort": ("int", queue_port),
+        "QueuePort": ("int", queue_port), "QueryPort": ("int", game_port),
     }}
     for section, keys in extra.items():
         owned.setdefault(section, {}).update(keys)
@@ -481,7 +485,8 @@ def cmd_apply():
             existing = f.read()
     except OSError:
         pass
-    text = render_game_ini(existing, values, rcon_password(), RCON_PORT, int(os.environ.get("ISLE_QUEUE_PORT", "10000")))
+    text = render_game_ini(existing, values, rcon_password(), RCON_PORT, int(os.environ.get("ISLE_QUEUE_PORT", "10000")),
+                           int(os.environ.get("ISLE_PORT", "7777")))
     write_text(GAME_INI, text)
     apply_unbans(notes)
     state = read_json(STATE_FILE, {}) or {}

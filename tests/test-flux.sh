@@ -46,6 +46,8 @@ check "the RCON password is kept" "$(iniv RconPassword)" "$(isle rcon-password)"
 check "no password: bServerPassword off" "false" "$(iniv bServerPassword)"
 check "admins: only SteamID64s, one line each" "76561197960287930" "$(iniv AdminsSteamIDs)"
 check "every playable class by default" "20" "$(grep -c '^AllowedClasses=' "${ini}")"
+check "QueryPort is the game port (what Epic is told)" "7777" "$(iniv QueryPort)"
+check "QueryPort follows ISLE_PORT" "41360" "$(isle ISLE_PORT=41360 apply >/dev/null; iniv QueryPort)"
 check "a bad env value falls back" "50" "$(isle ISLE_MAX_PLAYERS=lots apply >/dev/null; iniv MaxPlayerCount)"
 
 check "the panel takes settings" "0" "$(status isle set-settings '{"password": "pw1", "aiDensity": "0.5", "playables": ["Triceratops", "Omniraptor"], "disallowedAI": "Compsognathus, Boar"}')"
