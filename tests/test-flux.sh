@@ -157,6 +157,8 @@ check "per-player lines: a whole line is one name" "76561197960287930:Rex, the T
 # Mutations: the struct the game reads (the "Name, value" form is refused: ImportText, measured).
 check "mutations are written as the struct" '(MutationName="Hemomania",EffectValue=0.05) (MutationName="Pit Organ",EffectValue=1)' \
   "$(isle set-settings '{"enabledMutations": ["Hemomania, 0.05", {"name": "Pit Organ", "value": 1}]}' >/dev/null; isle apply >/dev/null; iniv EnabledMutations | tr '\n' ' ' | sed 's/ $//')"
+check "a tiny mutation value is written in fixed notation and read back" '(MutationName="Wader",EffectValue=0.00001)' \
+  "$(isle set-settings '{"enabledMutations": ["Wader, 0.00001"]}' >/dev/null; isle apply >/dev/null; iniv EnabledMutations | tr '\n' ' ' | sed 's/ $//')"
 check "in the game state section" "[/Script/TheIsle.TIGameStateBase]" "$(awk '/^\[/{s=$0} /^EnabledMutations=/{print s; exit}' "${ini}")"
 check "a struct comes back the same" '["(MutationName=\"Hematophagy\",EffectValue=0.25)"]' "$(py 'import json; print(json.dumps(t.coerce("enabledMutations", ["(MutationName=\"Hematophagy\",EffectValue=0.25)"])))')"
 check "a list saved in the old form is read as the struct" '(MutationName="Wader",EffectValue=0.25)' \

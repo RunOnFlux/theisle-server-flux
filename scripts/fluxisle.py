@@ -265,7 +265,10 @@ def mutation_entry(name, value):
         raise ValueError(f"enabledMutations: {name} needs a number") from None
     if not 0 <= v <= 100:
         raise ValueError(f"enabledMutations: {name} must be from 0 to 100")
-    return f'(MutationName="{name}",EffectValue={v:g})'
+    # Fixed notation: %g writes 1e-05 for a small value, and the readers (here and in the panel) take
+    # digits and a point only, so the whole list would read back as empty.
+    text = f"{v:.6f}".rstrip("0").rstrip(".") or "0"
+    return f'(MutationName="{name}",EffectValue={text})'
 
 
 def mutation_entries(value):
