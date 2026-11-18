@@ -142,6 +142,7 @@ Bans are in hours: 0 expires at once, so there is no permanent ban; use a large 
 
 ## Versions
 
+- **1.1.3** (2026-11-18): an `enabledMutations` value below 0.000001 is written in fixed notation (it used to be `1e-05`, which neither the image nor the panel could read back, so the whole mutation list came back empty).
 - **1.1.2** (2026-10-20): `QueryPort` written to Game.ini as the game port. It is the port the
   server registers with Epic Online Services, so the in-game server list sent every player of a
   server on a port other than 7777 to 7777, and the join timed out.
